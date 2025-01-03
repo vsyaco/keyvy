@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::{str, thread};
 
@@ -133,7 +133,10 @@ fn handle_ttl(parts: &Vec<&str>, store: &HashMap<String, CacheEntry>, writer: &m
 }
 
 fn main() -> std::io::Result<()> {
-    let store = Arc::new(Mutex::new(HashMap::new()));
+    let store = Arc::new(RwLock::new(HashMap::new()));
+
+    // Cleanup expired entries every 30 seconds
+    periodic_cleanup(&store, 30);
 
     // Bind the TCP listener to localhost:7878
     let listener = TcpListener::bind("127.0.0.1:7878")?;
