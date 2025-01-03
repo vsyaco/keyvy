@@ -28,7 +28,7 @@ impl CacheEntry {
 
     fn new_from_request(parts: &Vec<&str>) -> CacheEntry {
         let mut ttl = 0_u64;
-        let mut value = "";
+        let value;
 
         if parts.len() == 4 {
             ttl = parts[2].parse::<u64>().unwrap_or(0);
@@ -80,20 +80,27 @@ fn handle_set(parts: &Vec<&str>, store: &mut HashMap<String, CacheEntry>, writer
     writeln!(writer, "+OK").ok();
 }
 
-/**
- * Handle GET request
- */
-fn handle_get(parts: &Vec<&str>, store: &mut HashMap<String, CacheEntry>, writer: &mut TcpStream) {
-    let key = &key_from_request(parts);
+fn get_by_key<'a>(store: &'a HashMap<String, CacheEntry>, key: &str) -> Option<&'a CacheEntry> {
     match store.get(key) {
         Some(entry) => {
             if let Some(expiration) = entry.expires_at {
                 if Instant::now() >= expiration {
-                    store.remove(key);
-                    writeln!(writer, "$-1").ok();
-                    return;
+                    return None;
                 }
             }
+            Some(entry)
+        }
+        None => None,
+    }
+}
+
+/**
+ * Handle GET request
+ */
+fn handle_get(parts: &Vec<&str>, store: &HashMap<String, CacheEntry>, writer: &mut TcpStream) {
+    let key = &key_from_request(parts);
+    match get_by_key(store, key) {
+        Some(entry) => {
             writeln!(writer, "${}\r\n{}", entry.value.len(), entry.value).ok();
         }
         None => {
@@ -105,22 +112,16 @@ fn handle_get(parts: &Vec<&str>, store: &mut HashMap<String, CacheEntry>, writer
 /**
  * Handle TTL request
  */
-fn handle_ttl(parts: &Vec<&str>, store: &mut HashMap<String, CacheEntry>, writer: &mut TcpStream) {
+fn handle_ttl(parts: &Vec<&str>, store: &HashMap<String, CacheEntry>, writer: &mut TcpStream) {
     let key = &key_from_request(parts);
-    match store.get(key) {
+    match get_by_key(store, key) {
         Some(entry) => {
             if let Some(expiration) = entry.expires_at {
-                if Instant::now() >= expiration {
-                    store.remove(key);
-                    writeln!(writer, "-1").ok();
-                    return;
-                } else {
-                    let seconds_left = expiration
-                        .checked_duration_since(Instant::now())
-                        .unwrap()
-                        .as_secs();
-                    writeln!(writer, "{}", seconds_left).ok();
-                }
+                let seconds_left = expiration
+                    .checked_duration_since(Instant::now())
+                    .unwrap()
+                    .as_secs();
+                writeln!(writer, "{}", seconds_left).ok();
             } else {
                 writeln!(writer, "-1").ok();
             }
@@ -154,6 +155,26 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+fn periodic_cleanup(store: &Arc<RwLock<HashMap<String, CacheEntry>>>, interval: u64) {
+    let store_for_cleanup = Arc::clone(&store);
+    std::thread::spawn(move || {
+        use std::time::Duration;
+        loop {
+            std::thread::sleep(Duration::from_secs(interval));
+
+            let mut map = store_for_cleanup.write().unwrap();
+
+            // Retain only non-expired entries
+            map.retain(|_k, entry| {
+                match entry.expires_at {
+                    Some(exp) => Instant::now() < exp,
+                    None => true, // no TTL
+                }
+            });
+        }
+    });
+}
+
 fn log(string: &str) {
     println!("{}", string);
 }
@@ -184,7 +205,7 @@ fn check_params(writer: &mut TcpStream, parts: &Vec<&str>, command: &str) -> boo
     return true;
 }
 
-fn handle_connection(stream: TcpStream, store: Arc<Mutex<HashMap<String, CacheEntry>>>) {
+fn handle_connection(stream: TcpStream, store: Arc<RwLock<HashMap<String, CacheEntry>>>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = stream;
     let mut authendificated = false;
@@ -232,23 +253,23 @@ fn handle_connection(stream: TcpStream, store: Arc<Mutex<HashMap<String, CacheEn
                 if !check_authenticated(&mut writer, authendificated) {
                     continue;
                 }
-                let mut store = store.lock().unwrap();
-                handle_get(&parts, &mut store, &mut writer);
+                let store = store.read().unwrap();
+                handle_get(&parts, &store, &mut writer);
             }
 
             "TTL" => {
                 if !check_authenticated(&mut writer, authendificated) {
                     continue;
                 }
-                let mut store = store.lock().unwrap();
-                handle_ttl(&parts, &mut store, &mut writer);
+                let store = store.read().unwrap();
+                handle_ttl(&parts, &store, &mut writer);
             }
 
             "SET" => {
                 if !check_authenticated(&mut writer, authendificated) {
                     continue;
                 }
-                let mut store = store.lock().unwrap();
+                let mut store = store.write().unwrap();
                 handle_set(&parts, &mut store, &mut writer);
             }
 
@@ -256,12 +277,13 @@ fn handle_connection(stream: TcpStream, store: Arc<Mutex<HashMap<String, CacheEn
                 if !check_authenticated(&mut writer, authendificated) {
                     continue;
                 }
-                let mut store = store.lock().unwrap();
+                let mut store = store.write().unwrap();
                 handle_del(&parts, &mut store, &mut writer);
             }
 
             "QUIT" => {
                 writeln!(writer, "+OK").ok();
+                return;
             }
 
             _ => {
